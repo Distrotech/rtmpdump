@@ -26,7 +26,7 @@ LDFLAGS=-Wall $(XLDFLAGS)
 
 bindir=$(prefix)/bin
 sbindir=$(prefix)/sbin
-mandir=$(prefix)/man
+mandir=$(prefix)/share/man
 
 BINDIR=$(DESTDIR)$(bindir)
 SBINDIR=$(DESTDIR)$(sbindir)
