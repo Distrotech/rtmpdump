@@ -23,6 +23,7 @@
  *  http://www.gnu.org/copyleft/lgpl.html
  */
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -345,6 +346,8 @@ RTMP_Init(RTMP *r)
   r->m_fVideoCodecs = 252.0;
   r->Link.timeout = 30;
   r->Link.swfAge = 30;
+  r->m_sb.asynchronous = 0; // Add this option to send asynchronously packet to avoid block send function
+  r->m_sb.tcp_timeout = 0; // Add tcp timeout to avoid block connect function when no route is defined or user that have a bad connection
 }
 
 void
@@ -905,7 +908,9 @@ finish:
 int
 RTMP_Connect0(RTMP *r, struct sockaddr * service)
 {
+  int err;
   int on = 1;
+  int sel;
   r->m_sb.sb_timedout = FALSE;
   r->m_pausing = 0;
   r->m_fDuration = 0.0;
@@ -913,6 +918,42 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
   r->m_sb.sb_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (r->m_sb.sb_socket != -1)
     {
+    if (r->m_sb.tcp_timeout > 0) {
+        int flags = fcntl(r->m_sb.sb_socket, F_GETFL, 0);
+        fcntl(r->m_sb.sb_socket, F_SETFL, flags | O_NONBLOCK);
+        if (connect(r->m_sb.sb_socket, service, sizeof(struct sockaddr)) < 0) {
+          fd_set write_fds;
+          FD_ZERO(&write_fds);
+          FD_SET(r->m_sb.sb_socket, &write_fds);
+          struct timeval tv;
+          tv.tv_sec = r->m_sb.tcp_timeout / 1000000000;
+          tv.tv_usec = (r->m_sb.tcp_timeout - (tv.tv_sec * 1000000000)) / 1000;
+          while(1) {
+            sel = select(r->m_sb.sb_socket + 1, NULL, &write_fds, NULL, &tv);
+            if(sel == 0)
+              goto errno_error;
+            else if (sel > 0)
+              break;
+            else
+              goto errno_error;
+            break;
+          }
+        }
+        else
+          goto errno_error;
+        fcntl(r->m_sb.sb_socket, F_SETFL, SOCK_STREAM);
+        if (r->Link.socksport)
+	    {
+	      RTMP_Log(RTMP_LOGDEBUG, "%s ... SOCKS negotiation", __FUNCTION__);
+	      if (!SocksNegotiate(r))
+	        { 
+	          RTMP_Log(RTMP_LOGERROR, "%s, SOCKS negotiation failed.", __FUNCTION__);
+	          RTMP_Close(r);
+	          return FALSE;
+	        }
+	    }
+    }
+    else {
       if (connect(r->m_sb.sb_socket, service, sizeof(struct sockaddr)) < 0)
 	{
 	  int err = GetSockError();
@@ -931,6 +972,7 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
 	      RTMP_Close(r);
 	      return FALSE;
 	    }
+	}
 	}
     }
   else
@@ -954,6 +996,12 @@ RTMP_Connect0(RTMP *r, struct sockaddr * service)
   setsockopt(r->m_sb.sb_socket, IPPROTO_TCP, TCP_NODELAY, (char *) &on, sizeof(on));
 
   return TRUE;
+  errno_error:
+  err = GetSockError();
+  RTMP_Log(RTMP_LOGERROR, "%s, failed to connect socket. %d (%s)",
+	      __FUNCTION__, err, strerror(err));
+  RTMP_Close(r);
+  return FALSE;
 }
 
 int
@@ -4297,6 +4345,9 @@ int
 RTMPSockBuf_Send(RTMPSockBuf *sb, const char *buf, int len)
 {
   int rc;
+  int err;
+  fd_set  write_flags;
+  struct timeval timeout;
 
 #ifdef _DEBUG
   fwrite(buf, 1, len, netstackdump);
@@ -4310,7 +4361,28 @@ RTMPSockBuf_Send(RTMPSockBuf *sb, const char *buf, int len)
   else
 #endif
     {
-      rc = send(sb->sb_socket, buf, len, 0);
+      if (sb->asynchronous)
+        {
+          timeout.tv_sec = 0;
+          timeout.tv_usec = 300000;
+          FD_ZERO(&write_flags);      // initialize the writer socket set
+          FD_SET(sb->sb_socket, &write_flags);   // set the write notification for the socket based on the current state of the buffer
+          err = select(sb->sb_socket+1, NULL, &write_flags, NULL, &timeout);
+          if (err == 0)
+            {
+              RTMP_Log(RTMP_LOGERROR, "send packet timeout, may be a connection problem");
+              rc = -1;
+            }
+          else if (err > 0)
+              rc = send(sb->sb_socket, buf, len, 0);
+          else
+            {
+              RTMP_Log(RTMP_LOGERROR, "Invalid file descriptor");
+              rc = -1;
+            }   
+        } 
+      else
+        rc = send(sb->sb_socket, buf, len, 0);
     }
   return rc;
 }
